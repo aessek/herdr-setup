@@ -30,7 +30,7 @@ step. `$T install` does only that, for a manual refresh.
 Pick a short kebab-case name (it becomes the branch, the space and the agent
 name). Write a brief that stands alone. The agent knows only the brief and the
 repo, so include the goal, the scope and what is out of scope, the relevant
-files or plan number, and any decisions already made.
+files, and any decisions already made.
 
 ```bash
 $T new catalog-search "Add a search box to the Catalog tab that filters by name and family. UI only (internal/web); no API change. ..."
@@ -108,9 +108,7 @@ $T release minor      # bumps the minor version; patch is the default
 $T release minor --yes   # tags origin/main and pushes the tag
 ```
 
-Use `patch` for fixes and `minor` for anything that ships a new exec plan or
-feature. When a patch dry run includes newly added exec plans, it prints a
-note saying so.
+Use `patch` for fixes and `minor` for anything that ships a new feature.
 
 Show the user the dry run and get a yes before `--yes`. A release ships
 **everything on main**, not only the task you just landed. `release` refuses

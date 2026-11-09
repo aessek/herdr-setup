@@ -265,12 +265,6 @@ cmd_release() {
   local next="v$ma.$mi.$pa"
   say "$last -> $next at $BASE $(g rev-parse --short "$head"):"
   g log --oneline "$last..$head" >&2
-  local plans
-  plans=$(g diff --name-only --diff-filter=A "$last" "$head" -- exec-plans/ | grep -E '/[0-9]{3}_[^/]*\.md$' || true)
-  if [[ $bump == patch && -n $plans ]]; then
-    say "note: this ships new exec plan(s); a feature usually means 'minor':"
-    printf '  %s\n' $plans >&2
-  fi
   if [[ $yes -ne 1 ]]; then say "dry run; add --yes to tag and push $next"; return 0; fi
   g tag -a "$next" -m "$next" "$head"
   g push --quiet origin "refs/tags/$next"
