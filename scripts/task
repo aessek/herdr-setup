@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# task: one worktree + one Herdr space + one agent per task, landed on
+# origin/main and released by tag. The orchestrator's tool; workers never run
+# land or release. See .claude/skills/orchestrate/SKILL.md and AGENTS.md,
+# "Worktrees and releasing".
+#
+#   task install                  copy origin/main's scripts/herdr-templates into hc's templates
+#                                 (new does this itself; install is for a manual refresh)
+#   task new <name> [brief...]    worktree from origin/main, sidebar space, implementer agent
+#                                 (brief from the arguments, else stdin); rolled back if any step fails
+#   task new <name> --no-agent    worktree and branch only, for work the orchestrator does itself
+#   task ls                       every task: branch, ahead/behind, dirty, agent status
+#   task wait [name]              block until a child (or the named agent) has news; says
+#                                 plainly when it only timed out (TASK_WAIT_TIMEOUT, default 3000s)
+#   task review <name>            a read-only reviewer agent on the task's branch
+#   task land <name>              rebase on origin/main, make verify, fast-forward push to main
+#   task release [patch|minor|major] [--yes]
+#                                 tag origin/main with the next version (dry run without --yes)
+#   task rm <name> [--force]      end its agents, close its space, remove worktree and branch
+set -euo pipefail
+
+die() { printf 'task: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*" >&2; }
+
+command -v hc >/dev/null || die "hc (herdr-core) not on PATH"
+command -v herdr-app >/dev/null || die "herdr-app not on PATH"
+command -v jq >/dev/null || die "jq not on PATH"
+
+# The main checkout, wherever this runs from (any worktree shares its .git).
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not in a git repository"
+MAIN=$(dirname "$COMMON")
+REPO=$(basename "$MAIN")
+# The path Herdr's own worktree mod uses, so the sidebar nests these spaces
+# under the repo's.
+WT_ROOT="$HOME/.herdr/worktrees/$REPO"
+BASE=origin/main
+g() { git -C "$MAIN" "$@"; }
+
+check_name() {
+  [[ ${1:-} =~ ^[a-z][a-z0-9-]{0,23}$ ]] ||
+    die "task name must match ^[a-z][a-z0-9-]{0,23}\$ (it names a branch, a space and an agent): '${1:-}'"
+  [[ $1 != main ]] || die "'main' is not a task name"
+}
+
+wt_path() { printf '%s/%s' "$WT_ROOT" "$1"; }
+
+# The task's Herdr space id: recorded at creation, else found by folder.
+space_of() {
+  local id
+  id=$(g config --get "branch.$1.herdr-space" 2>/dev/null || true)
+  if [[ -n $id ]] && herdr-app ls | jq -e --arg id "$id" '.spaces[] | select(.id == $id)' >/dev/null; then
+    printf '%s' "$id"; return
+  fi
+  herdr-app ls | jq -r --arg f "$(wt_path "$1")" '[.spaces[] | select(.folder == $f) | .id][0] // empty'
+}
+
+agent_state() { # name [folder] -> working|blocked|done|idle|exited|none
+  local j
+  if j=$(hc get "$1" --json 2>/dev/null); then
+    jq -r 'if .state != "live" then "exited" else (.status.state // "unknown") end' <<<"$j"
+    return
+  fi
+  # Unnamed agents (started by hand in the sidebar): the first live agent
+  # whose launch folder is the worktree. hc ls has no status word, so fetch it.
+  [[ -n ${2:-} ]] || { printf 'none'; return; }
+  local addr
+  addr=$(hc ls --json | jq -r --arg f "$2" \
+    '[.terminals[] | select(.cwd == $f and .state == "live" and (.agent | IN("bash", "sh", "zsh", "fish") | not)) | .address][0] // empty')
+  [[ -n $addr ]] || { printf 'none'; return; }
+  hc get "$addr" --json | jq -r --arg a "$addr" '"\(.status.state // "unknown")(\($a))"'
+}
+
+start_agent() { # template name space cwd task
+  local template=$1 name=$2 space=$3 cwd=$4 task=$5 out addr tab
+  [[ -n ${HC_TERMINAL_ID:-} ]] || say "warning: not running in a Herdr terminal; $name gets no parent to report to"
+  out=$(hc run --bg --json --name "$name" --cwd "$cwd" --outlive-parent \
+    --label "herdr.space=$space" --label "task=$name" "$template" "$task") ||
+    die "hc run $template failed: $out"
+  addr=$(jq -r '.address' <<<"$out")
+  [[ $(jq -r '.first_message.sent' <<<"$out") == true ]] ||
+    say "warning: $name ($addr) did not get its task: $(jq -c '.first_message' <<<"$out"); hc read $name before resending"
+  # hc put it in a new, numbered tab of the space; name the tab after the role.
+  tab=$(herdr-app ls | jq -r --arg t "$addr" '[.spaces[].tabs[] | select(any(.terminals[]; .terminal == $t)) | .id][0] // empty')
+  if [[ -n $tab ]]; then
+    herdr-app do tab.rename --id "$tab" --name "$template" >/dev/null || true # cosmetic
+    # The implementer is what you look at; put it before the shell tab.
+    if [[ $template == implementer ]]; then
+      herdr-app do tab.move --id "$tab" --index 1 >/dev/null || true # cosmetic
+    fi
+  fi
+  printf '%s\n' "$addr"
+}
+
+# install_templates copies the templates as they are on origin/main (not from
+# this checkout, which may be stale or a task worktree that later goes away).
+# A real file each, replacing any older symlink, so nothing can dangle.
+install_templates() {
+  local dest="$HOME/.config/herdr-core/templates" f base tmp
+  mkdir -p "$dest"
+  g fetch --quiet origin
+  while IFS= read -r f; do
+    [[ $f == *.md ]] || continue
+    base=$(basename "$f"); tmp="$dest/.$base.tmp"
+    g show "$BASE:$f" >"$tmp"
+    rm -f "$dest/$base"; mv "$tmp" "$dest/$base"
+    [[ ${1:-} == quiet ]] || say "installed $base from $BASE"
+  done < <(g ls-tree --name-only "$BASE" scripts/herdr-templates/)
+}
+
+cmd_install() {
+  install_templates
+  hc templates
+}
+
+cmd_new() {
+  local name=${1:-}; check_name "$name"; shift
+  local agent=1
+  if [[ ${1:-} == --no-agent ]]; then agent=0; shift; fi
+  local brief="$*"
+  if [[ $agent -eq 1 && -z $brief && ! -t 0 ]]; then brief=$(cat); fi
+  [[ $agent -eq 0 || -n $brief ]] || die "task new $name needs a brief (arguments or stdin)"
+  local path; path=$(wt_path "$name")
+  g show-ref --verify --quiet "refs/heads/$name" && die "branch $name already exists"
+  [[ ! -e $path ]] || die "$path already exists"
+  hc get "$name" --json >/dev/null 2>&1 && die "a live terminal is already named $name"
+  if [[ $agent -eq 1 ]]; then
+    install_templates quiet
+    hc templates --json | jq -e '.templates[] | select(.name == "implementer")' >/dev/null ||
+      die "hc does not list the implementer template after install"
+  fi
+
+  g fetch --quiet origin
+  g worktree add --quiet --no-track -b "$name" "$path" "$BASE"
+  if [[ $agent -eq 0 ]]; then
+    say "task $name: $path on $name from $BASE, no agent; land with: task land $name"
+    return 0
+  fi
+  # From here on, a failure undoes what was made, so a retry starts clean.
+  local space=''
+  rollback() {
+    say "task new $name failed; rolling back"
+    # Each step is best-effort: undo whatever exists, ignore what doesn't.
+    if hc get "$name" --json >/dev/null 2>&1; then
+      hc kill "$name" >/dev/null 2>&1 || true
+      hc rm "$name" >/dev/null 2>&1 || true
+    fi
+    [[ -z $space ]] || herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 || true
+    g worktree remove --force "$path" 2>/dev/null || true
+    g branch --quiet -D "$name" 2>/dev/null || true
+    g config --unset "branch.$name.herdr-space" 2>/dev/null || true
+  }
+  local out
+  if ! out=$(herdr-app do space.new --name "$name" --folder "$path" --tab shell); then
+    rollback; die "space.new failed: $out"
+  fi
+  space=$(jq -r '.space' <<<"$out")
+  g config "branch.$name.herdr-space" "$space"
+
+  local addr
+  if ! addr=$(start_agent implementer "$name" "$space" "$path" "Task \`$name\`. Worktree $path, branch $name, based on $BASE at $(g rev-parse --short "$BASE").
+
+$brief"); then
+    rollback; die "could not start the implementer for $name (see the error above)"
+  fi
+  say "task $name: $path on $name from $BASE, space $space, agent $name ($addr)"
+}
+
+# cmd_wait wraps hc wait with a long timeout and says what woke it: news from
+# a child, or only the timeout (which is not a report; wait again).
+cmd_wait() {
+  local args=(--children any) out reason
+  if [[ -n ${1:-} ]]; then check_name "$1"; args=("$1"); fi
+  out=$(hc wait "${args[@]}" --json --timeout "${TASK_WAIT_TIMEOUT:-3000}") || true
+  printf '%s\n' "$out"
+  reason=$(jq -r '.reason // empty' <<<"$out" 2>/dev/null || true)
+  if [[ $reason == timeout ]]; then
+    say "wait: timed out with no news; nothing to read yet"
+    return 3
+  fi
+  if [[ -z ${1:-} ]] && [[ $(jq '.children | length' <<<"$out" 2>/dev/null || echo 0) -eq 0 ]]; then
+    say "wait: no children running; nothing to wait for"
+    return 4
+  fi
+  jq -r '.children[]? | "  \(.terminal): \(.status // .reason)"' <<<"$out" >&2 || true
+  say "wait: $reason; read the agent that reported with: hc read <name> --lines 80"
+}
+
+cmd_ls() {
+  g fetch --quiet origin || say "warning: fetch failed; ahead/behind may be stale"
+  local p name ab dirty
+  printf '%-24s %6s %6s %6s  %-14s %s\n' TASK AHEAD BEHIND DIRTY AGENT REVIEW
+  shopt -s nullglob
+  for p in "$WT_ROOT"/*/; do
+    p=${p%/}; name=$(basename "$p")
+    [[ -e $p/.git ]] || continue
+    ab=$(git -C "$p" rev-list --left-right --count "$BASE...HEAD" 2>/dev/null || echo "? ?")
+    dirty=$(git -C "$p" status --porcelain | wc -l)
+    printf '%-24s %6s %6s %6s  %-14s %s\n' "$name" "${ab#*[[:space:]]}" "${ab%%[[:space:]]*}" "$dirty" \
+      "$(agent_state "$name" "$p")" "$(agent_state "$name-review")"
+  done
+}
+
+cmd_review() {
+  local name=${1:-}; check_name "$name"
+  local path space; path=$(wt_path "$name")
+  [[ -d $path ]] || die "no worktree $path"
+  space=$(space_of "$name"); [[ -n $space ]] || die "no Herdr space for $name"
+  g fetch --quiet origin
+  local n; n=$(git -C "$path" rev-list --count "$BASE..HEAD")
+  [[ $n -gt 0 ]] || die "$name has no commits beyond $BASE to review"
+  local addr
+  addr=$(start_agent reviewer "$name-review" "$space" "$path" "Review branch \`$name\` in $path: the $n commit(s) in \`git log $BASE..HEAD\`, diff \`git diff $BASE...HEAD\`.")
+  say "reviewer $name-review ($addr) on $name"
+}
+
+cmd_land() {
+  local name=${1:-}; check_name "$name"
+  local path; path=$(wt_path "$name")
+  [[ -d $path ]] || die "no worktree $path"
+  [[ $(git -C "$path" rev-parse --abbrev-ref HEAD) == "$name" ]] || die "$path is not on branch $name"
+  [[ -z $(git -C "$path" status --porcelain) ]] || die "$name has uncommitted changes; the agent must commit or discard them"
+  local attempt
+  for attempt in 1 2 3; do
+    git -C "$path" fetch --quiet origin
+    if [[ $(git -C "$path" rev-list --count "$BASE..HEAD") -eq 0 ]]; then
+      say "$name has nothing beyond $BASE; nothing to land"; return 0
+    fi
+    if ! git -C "$path" rebase --quiet "$BASE"; then
+      git -C "$path" rebase --abort || true # restore the branch as it was
+      die "$name conflicts with $BASE; have its agent run 'git rebase $BASE', resolve, re-verify and commit"
+    fi
+    say "verifying $name at $(git -C "$path" rev-parse --short HEAD) (attempt $attempt)"
+    make -C "$path" verify || die "make verify failed on $name after rebase; nothing pushed"
+    if git -C "$path" push --quiet origin "HEAD:refs/heads/main"; then
+      say "landed $name: $BASE is now $(git -C "$path" rev-parse --short HEAD)"
+      git -C "$path" log --oneline "$BASE@{1}..HEAD" 2>/dev/null || true # best-effort summary
+      return 0
+    fi
+    say "push rejected (main moved); rebasing again"
+  done
+  die "could not land $name after 3 attempts; main keeps moving"
+}
+
+cmd_release() {
+  local bump=patch yes=0 a
+  for a in "$@"; do
+    case $a in
+      patch|minor|major) bump=$a ;;
+      --yes) yes=1 ;;
+      *) die "release takes patch|minor|major and --yes, not '$a'" ;;
+    esac
+  done
+  g fetch --quiet --tags origin
+  local head; head=$(g rev-parse "$BASE")
+  local existing; existing=$(g tag --points-at "$head" -l 'v[0-9]*')
+  [[ -z $existing ]] || die "$BASE ($(g rev-parse --short "$head")) is already released as $existing"
+  local last; last=$(g tag -l 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+  [[ -n $last ]] || die "no vX.Y.Z tag to bump from"
+  local ma mi pa; IFS=. read -r ma mi pa <<<"${last#v}"
+  case $bump in
+    major) ma=$((ma + 1)); mi=0; pa=0 ;;
+    minor) mi=$((mi + 1)); pa=0 ;;
+    patch) pa=$((pa + 1)) ;;
+  esac
+  local next="v$ma.$mi.$pa"
+  say "$last -> $next at $BASE $(g rev-parse --short "$head"):"
+  g log --oneline "$last..$head" >&2
+  local plans
+  plans=$(g diff --name-only --diff-filter=A "$last" "$head" -- exec-plans/ | grep -E '/[0-9]{3}_[^/]*\.md$' || true)
+  if [[ $bump == patch && -n $plans ]]; then
+    say "note: this ships new exec plan(s); a feature usually means 'minor':"
+    printf '  %s\n' $plans >&2
+  fi
+  if [[ $yes -ne 1 ]]; then say "dry run; add --yes to tag and push $next"; return 0; fi
+  g tag -a "$next" -m "$next" "$head"
+  g push --quiet origin "refs/tags/$next"
+  say "pushed $next; CI builds the image and Kargo promotes it to prod"
+}
+
+cmd_rm() {
+  local name=${1:-}; check_name "$name"
+  local force=0; [[ ${2:-} == --force ]] && force=1
+  local path; path=$(wt_path "$name")
+  if [[ -d $path && $force -ne 1 ]]; then
+    [[ -z $(git -C "$path" status --porcelain) ]] || die "$name has uncommitted changes (use --force to discard)"
+    g fetch --quiet origin
+    local n; n=$(g rev-list --count "$BASE..$name" 2>/dev/null || echo 0)
+    [[ $n -eq 0 ]] || die "$name has $n commit(s) not on $BASE; land it first (or --force to discard)"
+  fi
+  local t
+  for t in "$name" "$name-review"; do
+    if hc get "$t" --json >/dev/null 2>&1; then
+      hc kill "$t" >/dev/null 2>&1 || true # may have exited already
+      hc rm "$t" >/dev/null 2>&1 || true
+    fi
+  done
+  local space; space=$(space_of "$name")
+  [[ -z $space ]] || herdr-app do space.close --id "$space" --confirmed true >/dev/null
+  if [[ -d $path ]]; then
+    if [[ $force -eq 1 ]]; then g worktree remove --force "$path"; else g worktree remove "$path"; fi
+  fi
+  g show-ref --verify --quiet "refs/heads/$name" && g branch --quiet -D "$name"
+  g config --unset "branch.$name.herdr-space" 2>/dev/null || true # gone with the branch already
+  say "removed task $name"
+}
+
+case ${1:-} in
+  install) shift; cmd_install "$@" ;;
+  new) shift; cmd_new "$@" ;;
+  ls) shift; cmd_ls "$@" ;;
+  wait) shift; cmd_wait "$@" ;;
+  review) shift; cmd_review "$@" ;;
+  land) shift; cmd_land "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  rm) shift; cmd_rm "$@" ;;
+  ''|-h|--help|help) sed -n '2,/^[^#]/{/^#/p}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (task --help)" ;;
+esac
